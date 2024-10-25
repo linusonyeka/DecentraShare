@@ -5,6 +5,7 @@
 (define-constant ERR-NOT-AUTHORIZED (err u1))
 (define-constant ERR-POST-NOT-FOUND (err u2))
 (define-constant ERR-INVALID-CONTENT (err u3))
+(define-constant ERR-TRANSFER-FAILED (err u4))
 
 ;; Data Variables
 (define-map posts 
@@ -19,7 +20,7 @@
 )
 
 (define-map user-profiles
-    { user: principal }
+    principal
     {
         username: (string-utf8 50),
         bio: (string-utf8 200),
@@ -78,12 +79,18 @@
 (define-public (tip-post (post-id uint) (amount uint))
     (match (map-get? posts { post-id: post-id })
         post-data (begin
-            (try! (stx-transfer? amount tx-sender (get author post-data)))
-            (map-set posts
-                { post-id: post-id }
-                (merge post-data { tips: (+ (get tips post-data) amount) })
+            (let ((tip-transfer (stx-transfer? amount tx-sender (get author post-data))))
+                (match tip-transfer
+                    success (begin
+                        (map-set posts
+                            { post-id: post-id }
+                            (merge post-data { tips: (+ (get tips post-data) amount) })
+                        )
+                        (ok true)
+                    )
+                    error (err ERR-TRANSFER-FAILED)
+                )
             )
-            (ok true)
         )
         (err ERR-POST-NOT-FOUND)
     )
@@ -91,27 +98,56 @@
 
 ;; Create or update profile
 (define-public (set-profile (username (string-utf8 50)) (bio (string-utf8 200)))
+    (let (
+        (existing-profile (map-get? user-profiles tx-sender))
+    )
     (map-set user-profiles
-        { user: tx-sender }
+        tx-sender
         {
             username: username,
             bio: bio,
-            followers: u0,
-            following: u0
+            followers: (match existing-profile 
+                profile (get followers profile)
+                u0),
+            following: (match existing-profile
+                profile (get following profile)
+                u0)
         }
     )
-    (ok true)
+    (ok true))
 )
 
 ;; Follow a user
 (define-public (follow-user (user principal))
+    (let (
+        (follower-profile (map-get? user-profiles tx-sender))
+        (following-profile (map-get? user-profiles user))
+    )
     (begin
+        ;; Set follow status
         (map-set follows
             { follower: tx-sender, following: user }
             { active: true }
         )
+        
+        ;; Update follower count of target user
+        (match following-profile
+            profile (map-set user-profiles
+                user
+                (merge profile { followers: (+ (get followers profile) u1) }))
+            false
+        )
+        
+        ;; Update following count of current user
+        (match follower-profile
+            profile (map-set user-profiles
+                tx-sender
+                (merge profile { following: (+ (get following profile) u1) }))
+            false
+        )
+        
         (ok true)
-    )
+    ))
 )
 
 ;; Private functions
@@ -133,7 +169,7 @@
 
 ;; Get user profile
 (define-read-only (get-profile (user principal))
-    (map-get? user-profiles { user: user })
+    (map-get? user-profiles user)
 )
 
 ;; Check if user follows another user
