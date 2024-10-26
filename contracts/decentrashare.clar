@@ -1,181 +1,176 @@
-;; DecentraShare - Decentralized Social Media Platform
-;; A smart contract for managing social media interactions on Stacks blockchain
+;; Define constants for error handling
+(define-constant ERR_USER_NOT_REGISTERED (err u100))
+(define-constant ERR_USER_ALREADY_REGISTERED (err u101))
+(define-constant ERR_POST_NOT_FOUND (err u102))
+(define-constant ERR_UNAUTHORIZED (err u103))
+(define-constant ERR_LIST_FULL (err u104))
 
-;; Constants
-(define-constant ERR-NOT-AUTHORIZED (err u1))
-(define-constant ERR-POST-NOT-FOUND (err u2))
-(define-constant ERR-INVALID-CONTENT (err u3))
-(define-constant ERR-TRANSFER-FAILED (err u4))
-
-;; Data Variables
-(define-map posts 
-    { post-id: uint }
-    {
-        author: principal,
-        content: (string-utf8 500),
-        timestamp: uint,
-        likes: uint,
-        tips: uint
-    }
+;; Define data structures for profiles, posts, and followers
+(define-map profiles
+  principal
+  {
+    username: (string-utf8 30),
+    bio: (string-utf8 150),
+    follower-count: uint,
+    post-count: uint
+  }
 )
 
-(define-map user-profiles
-    principal
-    {
-        username: (string-utf8 50),
-        bio: (string-utf8 200),
-        followers: uint,
-        following: uint
-    }
+(define-map posts
+  uint
+  {
+    author: principal,
+    content: (string-utf8 280),
+    timestamp: uint,
+    like-count: uint
+  }
 )
 
-(define-map follows
-    { follower: principal, following: principal }
-    { active: bool }
+(define-map followers
+  { follower: principal, followed: principal }
+  bool
 )
 
-;; Post counter
-(define-data-var post-counter uint u0)
+(define-map user-posts
+  principal
+  (list 50 uint)  ;; Stores post IDs for each user
+)
 
-;; Public functions
+;; Global variable for post IDs
+(define-data-var next-post-id uint u0)
 
-;; Create a new post
-(define-public (create-post (content (string-utf8 500)))
-    (let 
-        (
-            (post-id (+ (var-get post-counter) u1))
-        )
-        (try! (validate-content content))
-        (map-set posts
-            { post-id: post-id }
-            {
-                author: tx-sender,
-                content: content,
-                timestamp: block-height,
-                likes: u0,
-                tips: u0
-            }
-        )
-        (var-set post-counter post-id)
-        (ok post-id)
+;; Helper Functions
+
+;; Check if user is registered
+(define-private (is-registered (user principal))
+  (is-some (map-get? profiles user))
+)
+
+;; Helper function to filter list items after first
+(define-private (not-first-item (index uint))
+  (> index u0)
+)
+
+;; Helper function to truncate list if at max length
+(define-private (truncate-list (lst (list 50 uint)))
+  (if (< (len lst) u50)
+      (ok lst)
+      ;; Create new list without first element using filter
+      (ok (unwrap! (as-max-len? 
+              (filter not-first-item lst)
+              u50)
+          ERR_LIST_FULL))
+  )
+)
+
+;; Append to user's posts list safely, maintaining max length
+(define-private (safe-append-post (user principal) (post-id uint))
+  (let ((current-posts (default-to (list) (map-get? user-posts user))))
+    (if (< (len current-posts) u50)
+        ;; If list isn't full, just append
+        (ok (append current-posts post-id))
+        ;; If list is full, create new list with first element dropped
+        (ok (unwrap! (as-max-len? 
+                (concat (list post-id) 
+                       (filter not-first-item current-posts))
+                u50)
+            ERR_LIST_FULL))
     )
+  )
+)
+
+;; Public Functions
+
+;; Register a profile
+(define-public (register-user (username (string-utf8 30)) (bio (string-utf8 150)))
+  (let ((user tx-sender))
+    (if (is-registered user)
+        ERR_USER_ALREADY_REGISTERED
+        (begin
+          (map-set profiles user { username: username, bio: bio, follower-count: u0, post-count: u0 })
+          (ok true)
+        )
+    )
+  )
+)
+
+;; Create a post
+(define-public (create-post (content (string-utf8 280)))
+  (let ((user tx-sender))
+    (if (is-registered user)
+        (let ((post-id (var-get next-post-id)))
+          (map-set posts post-id { author: user, content: content, timestamp: block-height, like-count: u0 })
+          (var-set next-post-id (+ post-id u1))
+          ;; Update user's post list
+          (map-set user-posts user (unwrap! (safe-append-post user post-id) ERR_LIST_FULL))
+          ;; Update post count in profile
+          (map-set profiles user (merge (unwrap! (map-get? profiles user) ERR_USER_NOT_REGISTERED) 
+                                      { post-count: (+ (get post-count (unwrap! (map-get? profiles user) ERR_USER_NOT_REGISTERED)) u1) }))
+          (ok post-id)
+        )
+        ERR_USER_NOT_REGISTERED
+    )
+  )
 )
 
 ;; Like a post
 (define-public (like-post (post-id uint))
-    (match (map-get? posts { post-id: post-id })
-        post-data (begin
-            (map-set posts
-                { post-id: post-id }
-                (merge post-data { likes: (+ (get likes post-data) u1) })
-            )
-            (ok true)
+  (let ((user tx-sender))
+    (if (is-registered user)
+        (let ((post (unwrap! (map-get? posts post-id) ERR_POST_NOT_FOUND)))
+          (map-set posts post-id (merge post { like-count: (+ (get like-count post) u1) }))
+          (ok true)
         )
-        (err ERR-POST-NOT-FOUND)
+        ERR_USER_NOT_REGISTERED
     )
+  )
 )
 
-;; Tip a post with STX
-(define-public (tip-post (post-id uint) (amount uint))
-    (match (map-get? posts { post-id: post-id })
-        post-data (begin
-            (let ((tip-transfer (stx-transfer? amount tx-sender (get author post-data))))
-                (match tip-transfer
-                    success (begin
-                        (map-set posts
-                            { post-id: post-id }
-                            (merge post-data { tips: (+ (get tips post-data) amount) })
-                        )
-                        (ok true)
-                    )
-                    error (err ERR-TRANSFER-FAILED)
+;; Follow/Unfollow a user
+(define-public (toggle-follow (user-to-follow principal))
+  (let ((user tx-sender))
+    (if (is-registered user)
+        (if (is-registered user-to-follow)
+            (if (not (is-eq user user-to-follow))
+                (let ((follow-status (default-to false (map-get? followers { follower: user, followed: user-to-follow }))))
+                  ;; Toggle follow status
+                  (map-set followers { follower: user, followed: user-to-follow } (not follow-status))
+                  ;; Update follower count
+                  (let ((followed-profile (unwrap! (map-get? profiles user-to-follow) ERR_USER_NOT_REGISTERED)))
+                    (map-set profiles user-to-follow (merge followed-profile 
+                      { follower-count: (if follow-status 
+                                          (- (get follower-count followed-profile) u1) 
+                                          (+ (get follower-count followed-profile) u1)) }))
+                    (ok (not follow-status))
+                  )
                 )
+                ERR_UNAUTHORIZED
             )
+            ERR_USER_NOT_REGISTERED
         )
-        (err ERR-POST-NOT-FOUND)
+        ERR_USER_NOT_REGISTERED
     )
+  )
 )
 
-;; Create or update profile
-(define-public (set-profile (username (string-utf8 50)) (bio (string-utf8 200)))
-    (let (
-        (existing-profile (map-get? user-profiles tx-sender))
-    )
-    (map-set user-profiles
-        tx-sender
-        {
-            username: username,
-            bio: bio,
-            followers: (match existing-profile 
-                profile (get followers profile)
-                u0),
-            following: (match existing-profile
-                profile (get following profile)
-                u0)
-        }
-    )
-    (ok true))
-)
-
-;; Follow a user
-(define-public (follow-user (user principal))
-    (let (
-        (follower-profile (map-get? user-profiles tx-sender))
-        (following-profile (map-get? user-profiles user))
-    )
-    (begin
-        ;; Set follow status
-        (map-set follows
-            { follower: tx-sender, following: user }
-            { active: true }
-        )
-        
-        ;; Update follower count of target user
-        (match following-profile
-            profile (map-set user-profiles
-                user
-                (merge profile { followers: (+ (get followers profile) u1) }))
-            false
-        )
-        
-        ;; Update following count of current user
-        (match follower-profile
-            profile (map-set user-profiles
-                tx-sender
-                (merge profile { following: (+ (get following profile) u1) }))
-            false
-        )
-        
-        (ok true)
-    ))
-)
-
-;; Private functions
-
-;; Validate content
-(define-private (validate-content (content (string-utf8 500)))
-    (if (> (len content) u0)
-        (ok true)
-        (err ERR-INVALID-CONTENT)
-    )
-)
-
-;; Read-only functions
-
-;; Get post details
-(define-read-only (get-post (post-id uint))
-    (map-get? posts { post-id: post-id })
-)
+;; Read-Only Functions
 
 ;; Get user profile
 (define-read-only (get-profile (user principal))
-    (map-get? user-profiles user)
+  (map-get? profiles user)
 )
 
-;; Check if user follows another user
-(define-read-only (is-following (follower principal) (following principal))
-    (default-to
-        false
-        (get active (map-get? follows { follower: follower, following: following }))
-    )
+;; Get post details
+(define-read-only (get-post (post-id uint))
+  (map-get? posts post-id)
+)
+
+;; Get user posts
+(define-read-only (get-user-posts (user principal))
+  (map-get? user-posts user)
+)
+
+;; Check follow status
+(define-read-only (is-following (follower principal) (followed principal))
+  (default-to false (map-get? followers { follower: follower, followed: followed }))
 )
